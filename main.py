@@ -29,6 +29,7 @@ from data.imagenet_variants import thousand_k_to_200, imagenet_a_mask, imagenet_
 from transformers import CLIPProcessor, CLIPModel, CLIPVisionModel
 import copy
 import pandas as pd
+from mc_lora import MC_LoRA
 
 
 model_names = sorted(name for name in models.__dict__
@@ -67,11 +68,16 @@ def data_uncertainity(outputs): # Data Uncertainty = E[H(Pi)]
     return avg_entropy
 
 # Test-time Adaptation function for our proposed TTL
-def test_time_tuning(model, inputs, optimizer, scaler, args):
+def test_time_tuning(model, inputs, optimizer, scaler, args, mc_lora_adapter=None):
     if args.cocoop:
         image_feature, pgen_ctx = inputs
         pgen_ctx.requires_grad = True
         optimizer = torch.optim.AdamW([pgen_ctx], args.lr)
+
+    if args.mc_lora and mc_lora_adapter is not None:
+        for j in range(args.tta_steps):
+            _ = mc_lora_adapter(inputs)
+        return
     
     if args.deyo_selection and args.lora_encoder != 'prompt':
         import deyo
@@ -317,6 +323,9 @@ def test_time_adapt_eval(val_loader, model, model_state, optimizer, optim_state,
             else:
                 model.LoRA_reset()
     end = time.time()    
+    mc_lora_adapter = None
+    if args.mc_lora:
+        mc_lora_adapter = MC_LoRA(model, optimizer, scaler, args)
 
     for i, (images, target) in enumerate(val_loader): #FIXME: at one loop, processing one image, i.e., its +63 (augmented) variation in total 
         # args = init_args
@@ -364,7 +373,7 @@ def test_time_adapt_eval(val_loader, model, model_state, optimizer, optim_state,
 
 
 if __name__ == '__main__':
-    default_data_root = 'datasets'
+    default_data_root = '/home/raza.imam/Documents/TPT/datasets'
     default_test_sets = 'A' #'A/V/R/K' #flower102/DTD/Pets/UCF101/Caltech101/Aircraft/eurosat/Cars/Food101/SUN397
     default_arch = 'ViT-B/16' #ViT-B/16 #RN50
     default_bs = 64
@@ -422,13 +431,13 @@ if __name__ == '__main__':
     parser.add_argument('--filter_plpd', default=0, type=int)
     parser.add_argument('--reweight_ent', default=1, type=int)
     parser.add_argument('--reweight_plpd', default=0, type=int)
-    parser.add_argument('--use_duel', action='store_true', default=True, help='Use DUEL loss instead of standard DeYO entropy/PLPD')
-    parser.add_argument('--lambda_ood', default=0.5, type=float, help='Weight for OOD Suppression Loss')
-    parser.add_argument('--lambda_anchor', default=1.0, type=float, help='Weight for Feature Anchor Loss')
+
+    parser.add_argument('--mc_lora', action='store_true', default=False, help="use mc_lora")
+    parser.add_argument('--mclora_tau', default=0.95, type=float, help='Energy threshold for Manifold Rank')
+    parser.add_argument('--mclora_alpha', default=0.05, type=float, help='Safe Zone ratio (alpha)')
+    parser.add_argument('--mclora_n_min', default=5, type=int, help='Minimum safe classes')
+    parser.add_argument('--mclora_lambda', default=0, type=float, help='Weight for TMA loss')
     
     args = parser.parse_args()
-
-    if args.use_duel:
-        args.deyo_selection = True
 
     main()
