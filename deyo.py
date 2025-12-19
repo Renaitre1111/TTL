@@ -251,4 +251,3 @@ def configure_model(model):
         if isinstance(m, (nn.LayerNorm, nn.GroupNorm)):
             m.requires_grad_(True)
     return model
-
