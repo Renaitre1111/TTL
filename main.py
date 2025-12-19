@@ -11,6 +11,7 @@ import torch.optim
 import torch.utils.data
 import torch.utils.data.distributed
 import torchvision.transforms as transforms
+import torch.nn.functional as F
 
 try:
     from torchvision.transforms import InterpolationMode
@@ -38,35 +39,72 @@ model_names = sorted(name for name in models.__dict__
 def list_of_ints(arg):
     return list(map(int, arg.split(',')))
 
-def quartile_selection(batch_entropy, quartile=0):
-    """returns indices of the desired quartile of the batch_entropy"""
-    sorted_indices = torch.argsort(batch_entropy, descending=False)
-    num_chunks = 8
-    chunk_size = len(sorted_indices) // num_chunks
-    reshaped_indices = sorted_indices[:num_chunks * chunk_size].view(num_chunks, chunk_size)
-    idx = reshaped_indices[quartile]
-    return idx
+def duel_loss(outputs, current_features, original_features, lambda_ood=0.5, lambda_anchor=1.0):
+    """
+    Proposed DUEL: Dynamic Uncertainty Evidential Learning Loss
+    """
+    # 1. Theoretical Foundation: From Probability to Evidence
+    # outputs: logits (z_i) [N, K]
+    # evidence: e_i = Softplus(z_i)
+    # Ensure non-negativity
+    evidence = F.softplus(outputs)
+    
+    # Dirichlet parameters: alpha = e + 1
+    alpha = evidence + 1
+    
+    # Total evidence strength S_i = sum(alpha)
+    S = torch.sum(alpha, dim=1, keepdim=True) # [N, 1]
+    
+    # Number of classes K
+    K = outputs.size(1)
+    
+    # Uncertainty Mass u_i = K / S
+    u = K / S # [N, 1]
+    
+    # Predicted probability p_hat = alpha / S
+    prob = alpha / S # [N, K]
+    
+    # 2. Optimization Dynamics: Dual-Channel Gradient Shaping
+    
+    # Channel 1: Reliable Channel (Positive Learning) -> Evidential Entropy Minimization
+    # For samples with low uncertainty (high evidence)
+    # L_rel = - sum(p * log(p))
+    prob = torch.clamp(prob, min=1e-8) # Numerical stability
+    L_rel = -torch.sum(prob * torch.log(prob), dim=1, keepdim=True) # [N, 1]
+    
+    # Channel 2: OOD Channel (Negative Suppression) -> Evidence Suppression
+    # For samples with high uncertainty (low evidence)
+    # L_ood = sum(e_ik)
+    L_ood = torch.sum(evidence, dim=1, keepdim=True) # [N, 1]
+    
+    # Dynamic Gating
+    # L_adapt = (1 - u) * L_rel + lambda_ood * u * L_ood
+    # Note: u is in [0, 1]. High u means OOD -> Weight L_ood more.
+    L_adapt_batch = (1 - u) * L_rel + lambda_ood * u * L_ood
+    L_adapt = L_adapt_batch.mean()
+    
+    # 3. Geometric Constraint: Feature Anchoring
+    # L_anchor = || f_adapt - f_orig ||^2
+    # Enforce adapted features to remain within localized manifold of zero-shot features
+    if original_features is not None:
+        L_anchor_val = F.mse_loss(current_features, original_features)
+    else:
+        L_anchor_val = 0.0
+        
+    # Final Objective
+    total_loss = L_adapt + lambda_anchor * L_anchor_val
+    
+    return total_loss
 
-def select_confident_samples(logits, top): #FIXME: 10% (top=0.1) confident views of the total augmented views to be selected
-    batch_entropy = -(logits.softmax(1) * logits.log_softmax(1)).sum(1) # H(P1), H(P2), ..., H(Pn) #FIXME: Entropy of each of the 64 views
-    idx = torch.argsort(batch_entropy, descending=False)[:int(batch_entropy.size()[0] * top)] # Filter the best 6 views
-    # idx = quartile_selection(batch_entropy, quartile=7)
-    return logits[idx], idx
-
-def avg_entropy(outputs, plot=True): # Total Uncertainty = H[E(Pi)] 
-    logits = outputs - outputs.logsumexp(dim=-1, keepdim=True) # logits = outputs.log_softmax(dim=1) [N, 1000]. Filtered logits. Representing in probability distribution/space
-    avg_logits = logits.logsumexp(dim=0) - np.log(logits.shape[0]) # avg_logits = logits.mean(0) [1, 1000]. Averaging filtered logits
+def avg_entropy(outputs): 
+    # Fallback/Original method
+    logits = outputs - outputs.logsumexp(dim=-1, keepdim=True) 
+    avg_logits = logits.logsumexp(dim=0) - np.log(logits.shape[0]) 
     min_real = torch.finfo(avg_logits.dtype).min
     avg_logits = torch.clamp(avg_logits, min=min_real)
-    return -(avg_logits * torch.exp(avg_logits)).sum(dim=-1) # Computing Self-Entropy of averaged logits
+    return -(avg_logits * torch.exp(avg_logits)).sum(dim=-1)
 
-def data_uncertainity(outputs): # Data Uncertainty = E[H(Pi)]
-    logits = outputs - outputs.logsumexp(dim=-1, keepdim=True)  # logits = outputs.log_softmax(dim=1) [N, 1000]. Filtered logits
-    entropy_per_set = -(logits * torch.exp(logits)).sum(dim=-1) # entropy for each set of logits
-    avg_entropy = entropy_per_set.mean(dim=0) # mean entropy across all sets 
-    return avg_entropy
-
-# Test-time Adaptation function for our proposed TTL
+# Test-time Adaptation function for our proposed TTL (Modified for DUEL)
 def test_time_tuning(model, inputs, optimizer, scaler, args):
     if args.cocoop:
         image_feature, pgen_ctx = inputs
@@ -74,46 +112,75 @@ def test_time_tuning(model, inputs, optimizer, scaler, args):
         optimizer = torch.optim.AdamW([pgen_ctx], args.lr)
     
     if args.deyo_selection and args.lora_encoder != 'prompt':
+        # DeYO implementation (kept as is if user wants to switch back)
         import deyo
         for j in range(args.tta_steps):
             with torch.cuda.amp.autocast():
                 DeYO = deyo.DeYO(model, args, optimizer, scaler, steps=args.tta_steps, deyo_margin=args.deyo_margin, margin_e0=args.deyo_margin_e0)
                 outputs, backward, final_backward = DeYO(inputs)
-                # loss = DeYO(inputs)
-                
         return
     
-    else: #i.e., if args.lora_encoder == 'prompt' (i.e., below block will run TPT)
-        selected_idx = None
+    else: 
+        # DUEL Implementation
+        # Note: We do NOT filter samples using select_confident_samples anymore as per DUEL's philosophy 
+        # of using "Dynamic Gating" on all augmented views.
+        
+        original_features = None
+        
         for j in range(args.tta_steps):
             with torch.cuda.amp.autocast():
-                        
-                # Sample Selection Block
+                
+                # Forward pass
                 if args.cocoop:
                     output = model((image_feature, pgen_ctx))
                 else:
-                    output = model(inputs) #FIXME: output.shape = torch.Size([64, 1000])
+                    output = model(inputs) # output: Logits [batch_size, num_classes]
                 
-                if selected_idx is not None: 
-                    output = output[selected_idx] #FIXME: Now, output.shape = torch.Size([6, 1000])
+                # Capture current features for anchoring
+                # Assuming model is ClipTestTimeTuning from custom_clip.py
+                # It stores self.image_features during inference
+                try:
+                    current_features = model.image_features 
+                except AttributeError:
+                    # Fallback if model doesn't expose image_features directly
+                    current_features = None
+                
+                # On the first step, we cache the "Original" zero-shot features
+                # Since LoRA is reset before this function call, Step 0 features are the reference.
+                if j == 0 and current_features is not None:
+                    original_features = current_features.detach().clone()
+                
+                # Calculate DUEL Loss
+                if args.use_duel:
+                    loss = duel_loss(output, current_features, original_features, 
+                                     lambda_ood=args.lambda_ood, 
+                                     lambda_anchor=args.lambda_anchor)
                 else:
-                    output, selected_idx = select_confident_samples(output, top=args.selection_p)            
-                                
-                output = output.float()
-                loss = avg_entropy(output) # Loss = To Minimize (Self-Entropy of averaged logits)                
-            
-            optimizer.zero_grad() # Zero the gradients
-            scaler.scale(loss).backward() # compute gradient and do SGD step
-            scaler.step(optimizer) # Unscales the gradients of optimizer's assigned params in-place
-            scaler.update() # Update weights
+                    # Fallback to original entropy logic if DUEL is disabled via args
+                    # For original TPT/TTL logic
+                    # We might still want selection here if not using DUEL
+                    from main import select_confident_samples
+                    output_filtered, selected_idx = select_confident_samples(output, top=args.selection_p)
+                    loss = avg_entropy(output_filtered)
+
+            optimizer.zero_grad()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer) 
+            scaler.update()
                     
         return
-    
+
+# Original helper (kept for fallback)
+def select_confident_samples(logits, top): 
+    batch_entropy = -(logits.softmax(1) * logits.log_softmax(1)).sum(1) 
+    idx = torch.argsort(batch_entropy, descending=False)[:int(batch_entropy.size()[0] * top)] 
+    return logits[idx], idx
+
 def main():
     args = parser.parse_args()
     set_random_seed(args.seed)
-    device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
-    global visual_means, visual_vars
+    # device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
+    # global visual_means, visual_vars
     
     assert args.gpu is not None
     main_worker(args.gpu, args)
@@ -129,6 +196,7 @@ def main_worker(gpu, args):
     else:
         classnames = imagenet_classes
         print('len(classnames)', len(classnames))
+
     if args.cocoop:
         pass
     else:
@@ -150,24 +218,19 @@ def main_worker(gpu, args):
         
     for name, param in model.named_parameters():
         if not args.cocoop:
-            if args.lora_encoder == 'prompt': # (Just prompt learner) 
-            # if args.lora_encoder == 'prompt' or args.lora_encoder == 'image': # (Prompt learner + Image encoder)
+            if args.lora_encoder == 'prompt': 
                 if ("prompt_learner" in name):
                     param.requires_grad_(True)
                 else:
                     param.requires_grad_(False)    
             elif (lora_enc in name and ("lora_A" in name or "lora_B" in name) \
-                and any(f"layers.{i}." in name for i in range(args.layer_range[0], args.layer_range[1] + 1))): # (Just Image encoder)
+                and any(f"layers.{i}." in name for i in range(args.layer_range[0], args.layer_range[1] + 1))): 
                 param.requires_grad_(True)
             else:
                 param.requires_grad_(False)
         else:
             if "text_encoder" not in name:
                 param.requires_grad_(False)
-    
-    # for name, param in model.named_parameters(): # Enabling prompt learner
-    #     if ("prompt_learner" in name):
-    #         param.requires_grad_(True)
     
     print("=> Model created: visual backbone {}".format(args.arch))
     
@@ -182,10 +245,9 @@ def main_worker(gpu, args):
         pass
     else:
         if args.lora_encoder == 'prompt':
-            trainable_param = model.prompt_learner.parameters() #TODO: Defining Optimizer
+            trainable_param = model.prompt_learner.parameters()
             optimizer = torch.optim.AdamW(trainable_param, args.lr)
         else:
-        # For new CLIP (i.e., LoRA embedded CLIP)
             parameters_to_optimize = []
             if args.lora_encoder == 'text':
                 layers = model.text_encoder.text_model.encoder.layers
@@ -196,24 +258,16 @@ def main_worker(gpu, args):
                 if args.layer_range[0] <= i <= args.layer_range[1]:
                     lora_A_params_q = layer.self_attn.q_proj.lora_A.parameters()
                     lora_B_params_q = layer.self_attn.q_proj.lora_B.parameters()
-                    
                     lora_A_params_v = layer.self_attn.v_proj.lora_A.parameters()
                     lora_B_params_v = layer.self_attn.v_proj.lora_B.parameters()
                     
-                    # lora_A_params_k = layer.self_attn.k_proj.lora_A.parameters()
-                    # lora_B_params_k = layer.self_attn.k_proj.lora_B.parameters()
-
                     parameters_to_optimize.extend([
                         {'params': lora_A_params_q},
                         {'params': lora_B_params_q},
                         {'params': lora_A_params_v},
                         {'params': lora_B_params_v},
-                        # {'params': lora_A_params_k},
-                        # {'params': lora_B_params_k},
                     ])
 
-            # trainable_param = model.prompt_learner.parameters() # Enabling prompt learner
-            # parameters_to_optimize.extend([{'params': trainable_param}]) # Adding prompt learner
             print('len(parameters_to_optimize)', len(parameters_to_optimize))
             optimizer = torch.optim.AdamW(parameters_to_optimize, lr=args.lr)
         
@@ -237,7 +291,7 @@ def main_worker(gpu, args):
                 transforms.ToTensor(),
                 normalize])
             data_transform = AugMixAugmenter(base_transform, preprocess, n_views=args.batch_size-1, 
-                                            augmix=len(set_id)>1) #TODO: Augmentation here
+                                            augmix=len(set_id)>1)
             batchsize = 1
         else:
             data_transform = transforms.Compose([
@@ -308,48 +362,45 @@ def test_time_adapt_eval(val_loader, model, model_state, optimizer, optim_state,
         [batch_time, top1, top5],
         prefix='Test: ')
 
-    # reset model and switch to evaluate mode
     model.eval()
-    if not args.cocoop: # no need to reset cocoop because it's fixed
+    if not args.cocoop:
         with torch.no_grad():
             if args.lora_encoder == 'prompt':
-                model.reset() #for promptlearner class
+                model.reset() 
             else:
                 model.LoRA_reset()
     end = time.time()    
 
-    for i, (images, target) in enumerate(val_loader): #FIXME: at one loop, processing one image, i.e., its +63 (augmented) variation in total 
-        # args = init_args
+    for i, (images, target) in enumerate(val_loader):
         assert args.gpu is not None
         if isinstance(images, list):
             for k in range(len(images)):
                 images[k] = images[k].cuda(args.gpu, non_blocking=True)
-            image = images[0] #TODO: The first actual image
+            image = images[0] 
         else:
             if len(images.size()) > 4:
                 assert images.size()[0] == 1
                 images = images.squeeze(0)
             images = images.cuda(args.gpu, non_blocking=True)
             image = images
-        target = target.cuda(args.gpu, non_blocking=True) #FIXME: Actual label of the actual input image
+        target = target.cuda(args.gpu, non_blocking=True)
         if args.tpt:
             images = torch.cat(images, dim=0)
 
         if args.tta_steps > 0:
             with torch.no_grad():
-                if args.lora_encoder == 'prompt': # i.e. TPT
-                    model.reset() #for promptlearner class
+                if args.lora_encoder == 'prompt':
+                    model.reset() 
                 else:
-                    model.LoRA_reset() #for image encoder update, i.e., TTL (Ours)
+                    model.LoRA_reset()
         optimizer.load_state_dict(optim_state)
         
-        # Applying TTL here
-        test_time_tuning(model, images, optimizer, scaler, args) #FIXME: The proposed test-time prompt tuning
+        test_time_tuning(model, images, optimizer, scaler, args) 
 
         # Infernce
         with torch.no_grad():
             with torch.cuda.amp.autocast():
-                output = model(image) # Inferencing after model adaptation
+                output = model(image) 
 
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
         top1.update(acc1[0], image.size(0))
@@ -365,19 +416,19 @@ def test_time_adapt_eval(val_loader, model, model_state, optimizer, optim_state,
 
 if __name__ == '__main__':
     default_data_root = 'datasets'
-    default_test_sets = 'A' #'A/V/R/K' #flower102/DTD/Pets/UCF101/Caltech101/Aircraft/eurosat/Cars/Food101/SUN397
-    default_arch = 'ViT-B/16' #ViT-B/16 #RN50
+    default_test_sets = 'A'
+    default_arch = 'ViT-B/16'
     default_bs = 64
     default_ctx_init = 'a_photo_of_a' 
     default_lr = 5e-3
     default_tta_steps = 1
     default_print_frq = 10
-    default_gpu = 1
-    default_selection_p = 0.1 #0.1=6. 1.0=64
+    default_gpu = 0
+    default_selection_p = 0.1 
     default_layer_range = 9, 11
     default_init_method = 'xavier'
     default_lora_encoder = 'image'
-    default_deyo_selection = True
+    default_deyo_selection = False # Disable DEYO by default to use DUEL or Original
 
     parser = argparse.ArgumentParser(description='Test-time Prompt Tuning')
     parser.add_argument('data', metavar='DIR', nargs="?", default=default_data_root, help='path to dataset root')
@@ -397,7 +448,7 @@ if __name__ == '__main__':
     parser.add_argument('--ctx_init', default=default_ctx_init, type=str, help='init tunable prompts')
     parser.add_argument('--cocoop', action='store_true', default=False, help="use cocoop's output as prompt initialization")
     parser.add_argument('--load', default=None, type=str, help='path to a pre-trained coop/cocoop')
-    parser.add_argument('--seed', type=int, default=0) #No modify need
+    parser.add_argument('--seed', type=int, default=0) 
     parser.add_argument('--images_per_class', default=None, type=int, help='Number fo images per class to load (should be <=10)')
     parser.add_argument('--layer_range', type=list_of_ints, default=default_layer_range, help='inclusive range of layers to include for lora_A and lora_B.')
     parser.add_argument('--init_method', default=default_init_method, choices=['xavier', 'gaussian', 'kaiming', 'pretrained', None], help='Initialization method for LoRA weights (None=in_built xavier)')
@@ -406,22 +457,25 @@ if __name__ == '__main__':
 
     # Deyo args
     parser.add_argument('--deyo_selection', default=default_deyo_selection, help='Whether to use weighted deyo class')
-    
     parser.add_argument('--aug_type', default='patch', type=str, help='patch, pixel, occ')
     parser.add_argument('--occlusion_size', default=112, type=int)
     parser.add_argument('--patch_len', default=6, type=int, help='The number of patches per row/column')
     parser.add_argument('--row_start', default=56, type=int)
     parser.add_argument('--column_start', default=56, type=int)
     parser.add_argument('--deyo_margin', default=0.5, type=float,
-                        help='Entropy threshold for sample selection $\tau_\mathrm{Ent}$ in Eqn. (8)') # IMPORTANT
-    parser.add_argument('--deyo_margin_e0', default=0.4, type=float, help='Entropy margin for sample weighting $\mathrm{Ent}_0$ in Eqn. (10)')
+                        help='Entropy threshold for sample selection tau_Ent') 
+    parser.add_argument('--deyo_margin_e0', default=0.4, type=float, help='Entropy margin for sample weighting Ent_0')
     parser.add_argument('--plpd_threshold', default=0.2, type=float,
-                        help='PLPD threshold for sample selection $\tau_\mathrm{PLPD}$ in Eqn. (8)') # IMPORTANT
+                        help='PLPD threshold for sample selection tau_PLPD') 
     parser.add_argument('--fishers', default=0, type=int)
     parser.add_argument('--filter_ent', default=0, type=int)
     parser.add_argument('--filter_plpd', default=0, type=int)
     parser.add_argument('--reweight_ent', default=1, type=int)
     parser.add_argument('--reweight_plpd', default=0, type=int)
+    
+    parser.add_argument('--use_duel', default=True, type=bool, help='Whether to use DUEL optimization')
+    parser.add_argument('--lambda_ood', default=0.5, type=float, help='Weight for OOD Suppression Loss (lambda_ood)')
+    parser.add_argument('--lambda_anchor', default=1.0, type=float, help='Weight for Feature Anchor Loss (lambda_anchor)')
     
     args = parser.parse_args()
 
