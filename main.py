@@ -29,6 +29,7 @@ from data.imagenet_variants import thousand_k_to_200, imagenet_a_mask, imagenet_
 from transformers import CLIPProcessor, CLIPModel, CLIPVisionModel
 import copy
 import pandas as pd
+import gtf
 
 
 model_names = sorted(name for name in models.__dict__
@@ -72,6 +73,16 @@ def test_time_tuning(model, inputs, optimizer, scaler, args):
         image_feature, pgen_ctx = inputs
         pgen_ctx.requires_grad = True
         optimizer = torch.optim.AdamW([pgen_ctx], args.lr)
+
+    if args.gtf and args.lora_encoder != 'prompt':
+        import gtf
+        gtf_adapter = gtf.GTF(model, args, optimizer, scaler, steps=args.tta_steps, 
+                              beta=args.gtf_beta, lambda_e=args.gtf_lambda, svd_k=args.gtf_k)
+        
+        for j in range(args.tta_steps):
+            with torch.cuda.amp.autocast():
+                outputs = gtf_adapter(inputs)
+        return
     
     if args.deyo_selection and args.lora_encoder != 'prompt':
         import deyo
@@ -422,6 +433,12 @@ if __name__ == '__main__':
     parser.add_argument('--filter_plpd', default=0, type=int)
     parser.add_argument('--reweight_ent', default=1, type=int)
     parser.add_argument('--reweight_plpd', default=0, type=int)
+    # GTF Args
+    parser.add_argument('--gtf', action='store_true', default=False, help='Use Geometric-Thermodynamic Flow')
+    parser.add_argument('--gtf_beta', default=1.0, type=float, help='Sharpness for thermodynamic selection')
+    parser.add_argument('--gtf_lambda', default=0.5, type=float, help='Balance weight for energy flow loss')
+    parser.add_argument('--gtf_k', default=16, type=int, help='Rank k for SVD geometric constraint')
+    parser.add_argument('--gtf_momentum', default=0.9, type=float, help='Momentum for energy moving average')
     
     args = parser.parse_args()
 
