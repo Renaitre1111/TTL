@@ -76,8 +76,7 @@ def test_time_tuning(model, inputs, optimizer, scaler, args):
 
     if args.gtf and args.lora_encoder != 'prompt':
         import gtf
-        gtf_adapter = gtf.GTF(model, args, optimizer, scaler, steps=args.tta_steps, 
-                              beta=args.gtf_beta, lambda_e=args.gtf_lambda, svd_k=args.gtf_k)
+        gtf_adapter = gtf.GTF(model, args, optimizer, scaler, steps=args.tta_steps)
         
         for j in range(args.tta_steps):
             with torch.cuda.amp.autocast():
