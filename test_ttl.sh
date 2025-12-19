@@ -39,4 +39,3 @@ python3 main.py --data $DATA_ROOT \
                --rank $RANK \
                --deyo_selection $DEYO_SELECTION \
                --deyo_margin_e0 $DEYO_MARGIN_E0 \
-               --mc_lora

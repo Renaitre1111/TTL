@@ -701,28 +701,6 @@ class ClipTestTimeTuning(nn.Module):
             return self.directional_prompt_tuning(input)
         else:
             return self.inference(input, label, coeff)
-        
-    def compute_text_manifold(self, tau=0.95):
-        with torch.no_grad():
-            if self.prompt_learner.tokenized_prompts.shape[0] != self.prompt_learner.n_cls:
-                self.prompt_learner.reset_classnames(self.prompt_learner.classnames, self.arch)
-
-            tokenized_prompts = self.prompt_learner.tokenized_prompts
-            text_features = self.text_encoder(tokenized_prompts)
-            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-
-            U, S, Vh = torch.linalg.svd(text_features.float(), full_matrices=False)
-            S_squared = S ** 2
-            total_energy = torch.sum(S_squared)
-            cumulative_energy = torch.cumsum(S_squared, dim=0)
-            energy_ratio = cumulative_energy / total_energy
-
-            m = torch.searchsorted(energy_ratio, tau).item() + 1
-
-            self.manifold_basis = Vh[:m, :].t().to(self.device)
-
-            return self.manifold_basis
-
 
 
 def get_coop(clip_arch, test_set, device, n_ctx, ctx_init, learned_cls=False, layer_range=[0, 11], init_method=None, lora_encoder='text', rank=16):
