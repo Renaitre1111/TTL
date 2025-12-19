@@ -29,7 +29,6 @@ from data.imagenet_variants import thousand_k_to_200, imagenet_a_mask, imagenet_
 from transformers import CLIPProcessor, CLIPModel, CLIPVisionModel
 import copy
 import pandas as pd
-import duel
 
 
 model_names = sorted(name for name in models.__dict__
@@ -38,6 +37,21 @@ model_names = sorted(name for name in models.__dict__
 
 def list_of_ints(arg):
     return list(map(int, arg.split(',')))
+
+def quartile_selection(batch_entropy, quartile=0):
+    """returns indices of the desired quartile of the batch_entropy"""
+    sorted_indices = torch.argsort(batch_entropy, descending=False)
+    num_chunks = 8
+    chunk_size = len(sorted_indices) // num_chunks
+    reshaped_indices = sorted_indices[:num_chunks * chunk_size].view(num_chunks, chunk_size)
+    idx = reshaped_indices[quartile]
+    return idx
+
+def select_confident_samples(logits, top): #FIXME: 10% (top=0.1) confident views of the total augmented views to be selected
+    batch_entropy = -(logits.softmax(1) * logits.log_softmax(1)).sum(1) # H(P1), H(P2), ..., H(Pn) #FIXME: Entropy of each of the 64 views
+    idx = torch.argsort(batch_entropy, descending=False)[:int(batch_entropy.size()[0] * top)] # Filter the best 6 views
+    # idx = quartile_selection(batch_entropy, quartile=7)
+    return logits[idx], idx
 
 def avg_entropy(outputs, plot=True): # Total Uncertainty = H[E(Pi)] 
     logits = outputs - outputs.logsumexp(dim=-1, keepdim=True) # logits = outputs.log_softmax(dim=1) [N, 1000]. Filtered logits. Representing in probability distribution/space
@@ -59,14 +73,48 @@ def test_time_tuning(model, inputs, optimizer, scaler, args):
         pgen_ctx.requires_grad = True
         optimizer = torch.optim.AdamW([pgen_ctx], args.lr)
     
-    with torch.cuda.amp.autocast():
-        duel_adapter = duel.DUEL(model, optimizer, scaler, args)
-        duel_adapter(inputs)
-        return 
+    if args.deyo_selection and args.lora_encoder != 'prompt':
+        import deyo
+        for j in range(args.tta_steps):
+            with torch.cuda.amp.autocast():
+                DeYO = deyo.DeYO(model, args, optimizer, scaler, steps=args.tta_steps, deyo_margin=args.deyo_margin, margin_e0=args.deyo_margin_e0)
+                outputs, backward, final_backward = DeYO(inputs)
+                # loss = DeYO(inputs)
+                
+        return
+    
+    else: #i.e., if args.lora_encoder == 'prompt' (i.e., below block will run TPT)
+        selected_idx = None
+        for j in range(args.tta_steps):
+            with torch.cuda.amp.autocast():
+                        
+                # Sample Selection Block
+                if args.cocoop:
+                    output = model((image_feature, pgen_ctx))
+                else:
+                    output = model(inputs) #FIXME: output.shape = torch.Size([64, 1000])
+                
+                if selected_idx is not None: 
+                    output = output[selected_idx] #FIXME: Now, output.shape = torch.Size([6, 1000])
+                else:
+                    output, selected_idx = select_confident_samples(output, top=args.selection_p)            
+                                
+                output = output.float()
+                loss = avg_entropy(output) # Loss = To Minimize (Self-Entropy of averaged logits)                
+            
+            optimizer.zero_grad() # Zero the gradients
+            scaler.scale(loss).backward() # compute gradient and do SGD step
+            scaler.step(optimizer) # Unscales the gradients of optimizer's assigned params in-place
+            scaler.update() # Update weights
+                    
+        return
     
 def main():
     args = parser.parse_args()
     set_random_seed(args.seed)
+    device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
+    global visual_means, visual_vars
+    
     assert args.gpu is not None
     main_worker(args.gpu, args)
 
@@ -181,15 +229,27 @@ def main_worker(gpu, args):
     results = {}
     for set_id in datasets:
         print(set_id)
-        base_transform = transforms.Compose([
-            transforms.Resize(args.resolution, interpolation=BICUBIC, antialias=True),
-            transforms.CenterCrop(args.resolution)])
-        preprocess = transforms.Compose([
-            transforms.ToTensor(),
-            normalize])
-        data_transform = AugMixAugmenter(base_transform, preprocess, n_views=args.batch_size-1, 
-                                        augmix=len(set_id)>1) #TODO: Augmentation here
-        batchsize = 1
+        if args.tpt:
+            base_transform = transforms.Compose([
+                transforms.Resize(args.resolution, interpolation=BICUBIC, antialias=True),
+                transforms.CenterCrop(args.resolution)])
+            preprocess = transforms.Compose([
+                transforms.ToTensor(),
+                normalize])
+            data_transform = AugMixAugmenter(base_transform, preprocess, n_views=args.batch_size-1, 
+                                            augmix=len(set_id)>1) #TODO: Augmentation here
+            batchsize = 1
+        else:
+            data_transform = transforms.Compose([
+                transforms.Resize(args.resolution, interpolation=BICUBIC),
+                transforms.CenterCrop(args.resolution),
+                transforms.ToTensor(),
+                normalize,
+            ])
+            batchsize = args.batch_size
+
+        global D_TRANSFORM
+        D_TRANSFORM = data_transform
         
         print("evaluating: {}".format(set_id))
         if len(set_id) > 1: 
@@ -318,8 +378,6 @@ if __name__ == '__main__':
     default_init_method = 'xavier'
     default_lora_encoder = 'image'
     default_deyo_selection = True
-    default_lambda_ood = 0.5
-    default_lambda_anchor = 1.0
 
     parser = argparse.ArgumentParser(description='Test-time Prompt Tuning')
     parser.add_argument('data', metavar='DIR', nargs="?", default=default_data_root, help='path to dataset root')
@@ -364,8 +422,6 @@ if __name__ == '__main__':
     parser.add_argument('--filter_plpd', default=0, type=int)
     parser.add_argument('--reweight_ent', default=1, type=int)
     parser.add_argument('--reweight_plpd', default=0, type=int)
-    parser.add_argument('--lambda_ood', default=default_lambda_ood, type=float, help='weight for ood loss')
-    parser.add_argument('--lambda_anchor', default=default_lambda_anchor, type=float, help='weight for anchor loss')
     
     args = parser.parse_args()
 
