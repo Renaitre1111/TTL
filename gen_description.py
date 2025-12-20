@@ -3,11 +3,12 @@ import json
 import torch
 import re
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, GPTQConfig
 from data.imagnet_prompts import imagenet_classes
 from data.imagenet_variants import imagenet_a_mask
+import argparse
 
-MODEL_PATH = "models/Qwen2.5-32B-Instruct-GPTQ-Int4"
+MODEL_PATH = "models/Qwen2.5-32B-Instruct-GPTQ"
 OUTPUT_DIR = "./descriptors_output"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -125,10 +126,11 @@ def clean_json_output(text, class_name):
     return {class_name: f"A photo of a {class_name}."}
     
 print(f"Loading model from {MODEL_PATH}...")
+gptq_config = GPTQConfig(bits=4, disable_exllama=True)
 tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_PATH,
-    device_map="auto", 
+    device_map={"": "cuda:0"}, 
     trust_remote_code=True,
     torch_dtype=torch.float16
 )
@@ -157,10 +159,11 @@ def generate_dataset_captions(dataset_name, class_list):
         with torch.no_grad():
             generated_ids = model.generate(
                 inputs.input_ids,
-                max_new_tokens=128,
-                temperature=0.7, 
-                top_p=0.9,
-                do_sample=True
+                max_new_tokens=64,
+                do_sample=False,
+                use_cache=True,
+                repetition_penalty=1.1,
+                eos_token_id=tokenizer.eos_token_id
             )
         
         generated_ids = [
@@ -183,5 +186,29 @@ def generate_dataset_captions(dataset_name, class_list):
     print(f"Saved to {save_path}")
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--shard_id", type=int, default=0)
+    parser.add_argument("--num_shards", type=int, default=1)
+    parser.add_argument("--gpu", type=int, default=0)
+    args = parser.parse_args()
+
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
     imagenet_a_classes = [imagenet_classes[i] for i in imagenet_a_mask]
-    generate_dataset_captions("ImageNet-A", imagenet_a_classes)
+
+    total = len(imagenet_a_classes)
+    shard_size = (total + args.num_shards - 1) // args.num_shards
+
+    start = args.shard_id * shard_size
+    end = min(start + shard_size, total)
+
+    shard_classes = imagenet_a_classes[start:end]
+
+    print(
+        f"Shard {args.shard_id}/{args.num_shards}, "
+        f"GPU {args.gpu}, classes [{start}:{end})"
+    )
+
+    generate_dataset_captions(
+        f"ImageNet-A-shard{args.shard_id}",
+        shard_classes
+    )
