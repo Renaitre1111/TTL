@@ -438,6 +438,7 @@ if __name__ == '__main__':
     parser.add_argument('--gtf_lambda', default=0.5, type=float, help='Balance weight for energy flow loss')
     parser.add_argument('--gtf_k', default=16, type=int, help='Rank k for SVD geometric constraint')
     parser.add_argument('--gtf_momentum', default=0.9, type=float, help='Momentum for energy moving average')
+    parser.add_argument('--use_energy', action='store_true', default=False, help='Use Energy (instead of Entropy) for OOD filtering and Reweighting')
     
     args = parser.parse_args()
 

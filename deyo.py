@@ -89,6 +89,9 @@ def softmax_entropy(x: torch.Tensor) -> torch.Tensor:
     #x = x ** temprature #torch.unsqueeze(temprature, dim=-1)
     return -(x.softmax(1) * x.log_softmax(1)).sum(1)
 
+def free_energy(logits, temperature=1.0):
+    return -temperature * torch.logsumexp(logits / temperature, dim=1)
+
 @torch.enable_grad()  # ensure grads in possible no grad context for testing
 def forward_and_adapt_sar(x, iter_, model, args, optimizer, scaler, deyo_margin, margin, targets=None, flag=True, group=None):
     """Forward and adapt model input data.
@@ -100,13 +103,26 @@ def forward_and_adapt_sar(x, iter_, model, args, optimizer, scaler, deyo_margin,
     
     # optimizer.zero_grad()
     entropys = softmax_entropy(outputs)
-    if args.filter_ent:
-        # filter_ids_1 = torch.where((entropys < deyo_margin))
-        filter_ids_1 = torch.argsort(entropys, descending=False)[:int(entropys.size()[0] * args.selection_p)] # same as <select_confident_samples> function in tpt
-    else:    
-        filter_ids_1 = torch.where((entropys <= math.log(1000)))
-    entropys = entropys[filter_ids_1]
-    backward = len(entropys)
+    if hasattr(args, 'use_energy') and args.use_energy:
+        energies = free_energy(outputs, temperature=1.0)
+        if args.filter_ent:
+            # filter_ids_1 = torch.where((entropys < deyo_margin))
+            filter_ids_1 = torch.argsort(entropys, descending=False)[:int(entropys.size()[0] * args.selection_p)] # same as <select_confident_samples> function in tpt
+        else:    
+            filter_ids_1 = torch.where((entropys <= math.log(1000)))
+        
+        selected_entropys = entropys[filter_ids_1]
+    else:
+        if args.filter_ent:
+            filter_ids_1 = torch.argsort(entropys, descending=False)[:int(entropys.size()[0] * args.selection_p)] 
+        else:    
+            filter_ids_1 = torch.where((entropys <= math.log(1000)))
+        
+        selected_metric = entropys[filter_ids_1]
+    
+    entropys_for_loss = entropys[filter_ids_1]
+    backward = len(selected_metric)
+
     if backward==0:
         if targets is not None:
             return outputs, 0, 0, 0, 0
@@ -149,20 +165,14 @@ def forward_and_adapt_sar(x, iter_, model, args, optimizer, scaler, deyo_margin,
             filter_ids_2 = torch.where(plpd >= -2.0)
         entropys = entropys[filter_ids_2]
         plpd = plpd[filter_ids_2]
-    final_backward = len(entropys)
-        
     
+    final_backward = len(entropys_for_loss)
+        
     if targets is not None:
         corr_pl_1 = (targets[filter_ids_1] == prob_outputs.argmax(dim=1)).sum().item()
         corr_pl_2 = (targets[filter_ids_1][filter_ids_2] == prob_outputs[filter_ids_2].argmax(dim=1)).sum().item()
 
     if args.reweight_ent or args.reweight_plpd:
-        # prob = outputs[0].softmax(0)
-        # # if prob.max() >= 0.4 and prob.max() <= 0.6:
-        # if entropys.mean() >= 1.8 and entropys.mean() <= 2.3:
-        #     gaussian = True
-        # else:
-        #     gaussian = False
         gaussian = False
         if gaussian:
             mean_entropy = 2.14
@@ -172,13 +182,18 @@ def forward_and_adapt_sar(x, iter_, model, args, optimizer, scaler, deyo_margin,
             beta = 0.0
             coeff = alpha*coeff + beta
         else:
-            coeff = (args.reweight_ent * (1 / (torch.exp(((entropys.clone().detach()) - margin)))) 
-                    #  + args.reweight_plpd * (1 / (torch.exp(-1. * plpd.clone().detach())))
-                    )            
+            if hasattr(args, 'use_energy') and args.use_energy:
+                energies_subset = selected_metric
+                energy_shift = energies_subset - energies_subset.min() 
+                coeff = (args.reweight_ent * (1.0 / (torch.exp(energy_shift))))
+            else:
+                coeff = (args.reweight_ent * (1 / (torch.exp(((entropys.clone().detach()) - margin)))) 
+                        #  + args.reweight_plpd * (1 / (torch.exp(-1. * plpd.clone().detach())))
+                        )            
         # coeff = coeff / coeff.sum()
-        entropys = entropys.mul(coeff) 
+        entropys_for_loss = entropys_for_loss.mul(coeff)
         # entropys2 = softmax_entropy(model(x, coeff=coeff, filter_ids=filter_ids_2[0]))
-    loss = entropys.mean(0)
+    loss = entropys_for_loss.mean(0)
     # loss = entropys.mean(0) + entropys2.mean(0)
 
     if final_backward != 0:
